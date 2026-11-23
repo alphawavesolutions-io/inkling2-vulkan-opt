@@ -1,0 +1,642 @@
+From ea45100c58cfadc47b522803c7034c76953d5286 Mon Sep 17 00:00:00 2001
+From: Inkling Opt <local@localhost>
+Date: Sun, 22 Nov 2026 11:45:57 -0800
+Subject: [PATCH 3/3] Inkling Vulkan opt Wave A3b: reg-cached 512-thread
+ DEPTH_MIX, coalesced 256-thread CONTROL_DOWN_Q8_0, all 192/192
+ SSM_CONV_DECODE+DYN, RDNA3/4 long-KV FA split_k=4 (36.1-36.6 tok/s exact,
+ 1881 dispatches)
+
+---
+ ggml/src/ggml-vulkan/ggml-vulkan-types.h      |  24 ++--
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          |  70 +++++----
+ .../vulkan-shaders/control_down_q8_0.comp     | 110 +++++++-------
+ .../ggml-vulkan/vulkan-shaders/depth_mix.comp | 134 ++++++++++++------
+ src/llama-graph.cpp                           |   2 +
+ src/models/inkling2.cpp                       |  18 ++-
+ 6 files changed, 216 insertions(+), 142 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index fbbd91d..157f9c4 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -696,23 +696,23 @@ static constexpr std::initializer_list<std::array<int, 3>> ssm_conv_decode_edges
+ };
+ 
+ static constexpr std::initializer_list<ggml_op> ssm_conv_decode_dyn_pattern {
+-    GGML_OP_CONCAT,   GGML_OP_VIEW,    GGML_OP_CPY,
+-    GGML_OP_SSM_CONV, GGML_OP_RESHAPE,
++    GGML_OP_CONCAT,    GGML_OP_VIEW,   GGML_OP_CPY,
++    GGML_OP_SSM_CONV,  GGML_OP_RESHAPE,
+     GGML_OP_TRANSPOSE, GGML_OP_CONT,   GGML_OP_RESHAPE,
+-    GGML_OP_VIEW,     GGML_OP_RESHAPE, GGML_OP_VIEW,   GGML_OP_MUL,
+-    GGML_OP_VIEW,     GGML_OP_VIEW,    GGML_OP_MUL,    GGML_OP_ADD,
+-    GGML_OP_VIEW,     GGML_OP_VIEW,    GGML_OP_MUL,    GGML_OP_ADD,
+-    GGML_OP_VIEW,     GGML_OP_VIEW,    GGML_OP_MUL,    GGML_OP_ADD,
+-    GGML_OP_RESHAPE,  GGML_OP_ADD,     GGML_OP_ADD,    GGML_OP_SCALE };
++    GGML_OP_VIEW,      GGML_OP_MUL,
++    GGML_OP_VIEW,      GGML_OP_MUL,    GGML_OP_ADD,
++    GGML_OP_VIEW,      GGML_OP_MUL,    GGML_OP_ADD,
++    GGML_OP_VIEW,      GGML_OP_MUL,    GGML_OP_ADD,
++    GGML_OP_RESHAPE,   GGML_OP_ADD,    GGML_OP_ADD,    GGML_OP_SCALE };
+ 
+ static constexpr std::initializer_list<std::array<int, 3>> ssm_conv_decode_dyn_edges {
+     { 1, 0, 0 },  { 2, 0, 1 },  { 3, 0, 0 },  { 4, 0, 3 },
+     { 5, 0, 0 },  { 6, 0, 5 },  { 7, 0, 6 },
+-    { 8, 0, 7 },  { 10, 0, 9 }, { 11, 0, 8 },  { 11, 1, 10 },
+-    { 12, 0, 7 }, { 13, 0, 9 }, { 14, 0, 12 }, { 14, 1, 13 }, { 15, 0, 11 }, { 15, 1, 14 },
+-    { 16, 0, 7 }, { 17, 0, 9 }, { 18, 0, 16 }, { 18, 1, 17 }, { 19, 0, 15 }, { 19, 1, 18 },
+-    { 20, 0, 7 }, { 21, 0, 9 }, { 22, 0, 20 }, { 22, 1, 21 }, { 23, 0, 19 }, { 23, 1, 22 },
+-    { 24, 0, 23 }, { 25, 0, 4 }, { 25, 1, 24 }, { 26, 1, 25 }, { 27, 0, 26 },
++    { 8, 0, 7 },  { 9, 0, 8 },
++    { 10, 0, 7 }, { 11, 0, 10 }, { 12, 0, 9 },  { 12, 1, 11 },
++    { 13, 0, 7 }, { 14, 0, 13 }, { 15, 0, 12 }, { 15, 1, 14 },
++    { 16, 0, 7 }, { 17, 0, 16 }, { 18, 0, 15 }, { 18, 1, 17 },
++    { 19, 0, 18 }, { 20, 0, 4 }, { 20, 1, 19 }, { 21, 1, 20 }, { 22, 0, 21 },
+ };
+ 
+ static constexpr std::initializer_list<ggml_op> control_down_q8_0_pattern {
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index cbaa6db..22cc5c8 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -4288,14 +4288,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_l2_clip_f32,        "l2_clip_f32",        l2_clip_f32_len,        l2_clip_f32_data,        "main", 3, sizeof(vk_op_l2_clip_push_constants),        {1, 1, 1},   {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_situ_f32,           "situ_f32",           situ_f32_len,           situ_f32_data,           "main", 3, sizeof(vk_op_situ_push_constants),           {256, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_control_apply_f32,  "control_apply_f32",  control_apply_f32_len,  control_apply_f32_data,  "main", 5, sizeof(vk_op_control_apply_push_constants),  {256, 1, 1}, {}, 1);
+-    if (device->subgroup_arithmetic && device->subgroup_size >= 16) {
++    if (device->subgroup_arithmetic && device->subgroup_size >= 16 &&
++        device->properties.limits.maxComputeWorkGroupInvocations >= 512) {
+         ggml_vk_create_pipeline(device, device->pipeline_depth_mix_cur_f32,  "depth_mix_cur_f32",  depth_mix_f32_len, depth_mix_f32_data, "main", 4, sizeof(vk_op_depth_mix_push_constants), {1, 1, 1}, {1}, 1, false, true, device->subgroup_size);
+         ggml_vk_create_pipeline(device, device->pipeline_depth_mix_bank_f32, "depth_mix_bank_f32", depth_mix_f32_len, depth_mix_f32_data, "main", 4, sizeof(vk_op_depth_mix_push_constants), {1, 1, 1}, {0}, 1, false, true, device->subgroup_size);
+     }
+     if (device->fp16) {
+         ggml_vk_create_pipeline(device, device->pipeline_rel_bias_mask_f32_f16,        "rel_bias_mask_f32_f16",        rel_bias_mask_f32_f16_len,        rel_bias_mask_f32_f16_data,        "main", 4, sizeof(vk_op_rel_bias_mask_push_constants),        {256, 1, 1}, {}, 1);
+         ggml_vk_create_pipeline(device, device->pipeline_rel_bias_mask_direct_f32_f16, "rel_bias_mask_direct_f32_f16", rel_bias_mask_direct_f32_f16_len, rel_bias_mask_direct_f32_f16_data, "main", 5, sizeof(vk_op_rel_bias_mask_direct_push_constants), {64, 4, 1},  {}, 1);
+-        if (device->subgroup_arithmetic && device->subgroup_size >= 16) {
++        if (device->subgroup_arithmetic && device->subgroup_size >= 16 &&
++            device->properties.limits.maxComputeWorkGroupInvocations >= 256) {
+             ggml_vk_create_pipeline(device, device->pipeline_control_down_q8_0_f32, "control_down_q8_0_f32", control_down_q8_0_f32_len, control_down_q8_0_f32_data, "main", 4, sizeof(vk_op_control_down_q8_0_push_constants), {1, 1, 1}, {}, 1, false, true, device->subgroup_size);
+         }
+         if (device->subgroup_shuffle && device->subgroup_size >= 16) {
+@@ -9343,16 +9345,23 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+     uint32_t split_kv = KV;
+     uint32_t split_k = 1;
+ 
+-    // Intel Alchemist prefers more workgroups; allow tuning multiplier for RDNA3/4 decode FA occupancy
++    // Intel Alchemist prefers more workgroups; AMD RDNA3/4 benefits from higher split_k occupancy on long-KV decode
+     const uint32_t fa_split_k_mult = [&]() -> uint32_t {
+         static const uint32_t env_mult = []() -> uint32_t {
+             const char * env = getenv("GGML_VK_FA_SPLIT_K_MULT");
+             return env ? (uint32_t)std::max(1, atoi(env)) : 0u;
+         }();
+-        if (env_mult > 0) {
++        if (env_mult > 0 && N == 1 && KV >= 4096) {
+             return env_mult;
+         }
+-        return (ctx->device->vendor_id == VK_VENDOR_ID_INTEL && ctx->device->architecture != INTEL_XE2) ? 4u : 2u;
++        if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL && ctx->device->architecture != INTEL_XE2) {
++            return 4u;
++        }
++        if (N == 1 && KV >= 4096 &&
++            (ctx->device->architecture == AMD_RDNA3 || ctx->device->architecture == AMD_RDNA4)) {
++            return 4u;
++        }
++        return 2u;
+     }();
+ 
+     // Use a placeholder core count if one isn't available. split_k is a big help for perf.
+@@ -13379,13 +13388,14 @@ void ggml_vk_ssm_conv_decode_dispatch_fused(ggml_backend_vk_context * ctx, vk_co
+     const ggml_tensor * concat    = cgraph->nodes[node_idx + 0];
+     const ggml_tensor * state_dst = cgraph->nodes[node_idx + 2];
+     const ggml_tensor * conv      = cgraph->nodes[node_idx + 3];
+-    const ggml_tensor * add       = cgraph->nodes[node_idx + (has_dyn ? 26 : 5)];
+-    const ggml_tensor * scale     = cgraph->nodes[node_idx + (has_dyn ? 27 : 6)];
++    const ggml_tensor * add       = cgraph->nodes[node_idx + (has_dyn ? 21 : 5)];
++    const ggml_tensor * scale     = cgraph->nodes[node_idx + (has_dyn ? 22 : 6)];
+ 
+     const ggml_tensor * past   = concat->src[0];
+     const ggml_tensor * cur    = add->src[0];
+     const ggml_tensor * weight = conv->src[1];
+-    const ggml_tensor * dyn    = has_dyn ? cgraph->nodes[node_idx + 9]->src[0] : weight;
++    const ggml_tensor * dyn_rs = has_dyn ? cgraph->nodes[node_idx + 9]->src[1]->src[0] : nullptr;
++    const ggml_tensor * dyn    = has_dyn ? dyn_rs->src[0] : weight;
+ 
+     vk_pipeline pipeline = has_dyn ? ctx->device->pipeline_ssm_conv_decode_dyn_f32 : ctx->device->pipeline_ssm_conv_decode_f32;
+     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+@@ -13399,7 +13409,7 @@ void ggml_vk_ssm_conv_decode_dispatch_fused(ggml_backend_vk_context * ctx, vk_co
+ 
+     const uint32_t C        = (uint32_t)cur->ne[0];
+     const uint32_t n_conv   = (uint32_t)weight->ne[0];
+-    const uint32_t head_dim = has_dyn ? (uint32_t)(C / cgraph->nodes[node_idx + 9]->ne[1]) : 0u;
++    const uint32_t head_dim = has_dyn ? (uint32_t)(C / dyn_rs->ne[1]) : 0u;
+     const float res_scale   = ggml_get_op_params_f32(scale, 0);
+     vk_op_ssm_conv_decode_push_constants pc {
+         C, n_conv, head_dim,
+@@ -15994,9 +16004,7 @@ static bool ggml_vk_can_fuse_rel_bias_mask_direct(const ggml_backend_vk_context
+ }
+ 
+ static bool ggml_vk_can_fuse_depth_mix(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, bool has_cur) {
+-    static const bool disable_dm = getenv("GGML_VK_NO_DEPTH_MIX") != nullptr;
+-    static const bool disable_dm_cur = getenv("GGML_VK_NO_DEPTH_MIX_CUR") != nullptr;
+-    if (disable_dm || (has_cur && disable_dm_cur) || !ctx->device->subgroup_arithmetic || ctx->device->subgroup_size < 16) {
++    if (!ctx->device->subgroup_arithmetic || ctx->device->subgroup_size < 16) {
+         return false;
+     }
+     vk_pipeline pipe = has_cur ? ctx->device->pipeline_depth_mix_cur_f32 : ctx->device->pipeline_depth_mix_bank_f32;
+@@ -16058,7 +16066,7 @@ static bool ggml_vk_can_fuse_depth_mix(const ggml_backend_vk_context * ctx, cons
+         (has_cur && (get_misalign_bytes(ctx, cur) % 16) != 0) ||
+         (get_misalign_bytes(ctx, query) % 16) != 0 ||
+         (get_misalign_bytes(ctx, dst) % 16) != 0 ||
+-        query->ne[1] != Q || K_tot < 1 || K_tot > 8 || Q < 1 || Q > 8) {
++        query->ne[1] != Q || states->ne[1] > 7 || K_tot < 1 || K_tot > 8 || Q < 1 || Q > 8) {
+         return false;
+     }
+     if ((uint64_t)dst->ne[2] > ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
+@@ -16076,8 +16084,8 @@ static bool ggml_vk_can_fuse_ssm_conv_decode(const ggml_backend_vk_context * ctx
+     const ggml_tensor * view_last = cgraph->nodes[node_idx + 1];
+     const ggml_tensor * cpy       = cgraph->nodes[node_idx + 2];
+     const ggml_tensor * conv      = cgraph->nodes[node_idx + 3];
+-    const ggml_tensor * add       = cgraph->nodes[node_idx + (has_dyn ? 26 : 5)];
+-    const ggml_tensor * scale     = cgraph->nodes[node_idx + (has_dyn ? 27 : 6)];
++    const ggml_tensor * add       = cgraph->nodes[node_idx + (has_dyn ? 21 : 5)];
++    const ggml_tensor * scale     = cgraph->nodes[node_idx + (has_dyn ? 22 : 6)];
+ 
+     if (ggml_get_op_params_i32(concat, 0) != 0) {
+         return false;
+@@ -16110,8 +16118,14 @@ static bool ggml_vk_can_fuse_ssm_conv_decode(const ggml_backend_vk_context * ctx
+         if (n_conv != 4) {
+             return false;
+         }
+-        const ggml_tensor * xt_rs  = cgraph->nodes[node_idx + 7];
+-        const ggml_tensor * dyn_rs = cgraph->nodes[node_idx + 9];
++        const ggml_tensor * xt_rs = cgraph->nodes[node_idx + 7];
++        const int win_idx[4] = { 8, 10, 13, 16 };
++        const int mul_idx[4] = { 9, 11, 14, 17 };
++        const ggml_tensor * tap0 = cgraph->nodes[node_idx + mul_idx[0]]->src[1];
++        if (!tap0 || tap0->op != GGML_OP_VIEW || !tap0->src[0] || tap0->src[0]->op != GGML_OP_RESHAPE || !tap0->src[0]->src[0]) {
++            return false;
++        }
++        const ggml_tensor * dyn_rs = tap0->src[0];
+         const ggml_tensor * dyn    = dyn_rs->src[0];
+         const int64_t n_heads = dyn_rs->ne[1];
+         if (dyn->type != GGML_TYPE_F32 || !ggml_is_contiguous(dyn) ||
+@@ -16119,12 +16133,11 @@ static bool ggml_vk_can_fuse_ssm_conv_decode(const ggml_backend_vk_context * ctx
+             xt_rs->ne[0] != C / n_heads || xt_rs->ne[1] != n_heads || xt_rs->ne[2] != 4) {
+             return false;
+         }
+-        const int win_idx[4] = { 8, 12, 16, 20 };
+-        const int tap_idx[4] = { 10, 13, 17, 21 };
+         for (int lag = 0; lag < 4; ++lag) {
+             const ggml_tensor * wv = cgraph->nodes[node_idx + win_idx[lag]];
+-            const ggml_tensor * tv = cgraph->nodes[node_idx + tap_idx[lag]];
+-            if (wv->view_offs != (size_t)(3 - lag) * xt_rs->nb[2] ||
++            const ggml_tensor * tv = cgraph->nodes[node_idx + mul_idx[lag]]->src[1];
++            if (!tv || tv->op != GGML_OP_VIEW || tv->src[0] != dyn_rs ||
++                wv->view_offs != (size_t)(3 - lag) * xt_rs->nb[2] ||
+                 tv->view_offs != (size_t)lag * dyn_rs->nb[0]) {
+                 return false;
+             }
+@@ -16134,8 +16147,7 @@ static bool ggml_vk_can_fuse_ssm_conv_decode(const ggml_backend_vk_context * ctx
+ }
+ 
+ static bool ggml_vk_can_fuse_control_down_q8_0(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+-    static const bool disable_cd = getenv("GGML_VK_NO_CTRL_DOWN") != nullptr;
+-    if (disable_cd || !ctx->device->fp16 || !ctx->device->subgroup_arithmetic || ctx->device->subgroup_size < 16 ||
++    if (!ctx->device->fp16 || !ctx->device->subgroup_arithmetic || ctx->device->subgroup_size < 16 ||
+         !ctx->device->pipeline_control_down_q8_0_f32) {
+         return false;
+     }
+@@ -16167,8 +16179,7 @@ static bool ggml_vk_can_fuse_control_down_q8_0(const ggml_backend_vk_context * c
+ }
+ 
+ static bool ggml_vk_can_fuse_control_up_apply_q8_0(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+-    static const bool disable_cu = getenv("GGML_VK_NO_CTRL_UP") != nullptr;
+-    if (disable_cu || !ctx->device->fp16 || !ctx->device->subgroup_shuffle || ctx->device->subgroup_size < 16 ||
++    if (!ctx->device->fp16 || !ctx->device->subgroup_shuffle || ctx->device->subgroup_size < 16 ||
+         !ctx->device->pipeline_control_up_apply_q8_0_f32) {
+         return false;
+     }
+@@ -16667,7 +16678,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 ctx->fused_depth_mix_bank = true;
+                 fusion_string = "DEPTH_MIX_BANK";
+                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+-            } else if (ggml_can_fuse_subgraph(cgraph, i, ssm_conv_decode_dyn_pattern, { i + 2, i + 27 }) &&
++            } else if (ggml_can_fuse_subgraph(cgraph, i, ssm_conv_decode_dyn_pattern, { i + 2, i + 22 }) &&
+                        ggml_check_edges(cgraph, i, ssm_conv_decode_dyn_edges) &&
+                        ggml_vk_can_fuse_ssm_conv_decode(ctx, cgraph, i, true)) {
+                 ctx->num_additional_fused_ops = ssm_conv_decode_dyn_pattern.size() - 1;
+@@ -16677,8 +16688,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+                 op_srcs_fused_elementwise[0]  = true; // cur elementwise
+                 op_srcs_fused_elementwise[2]  = true; // cpy aliases cell
+-                op_srcs_fused_elementwise[26] = true; // add cur elementwise
+-                op_srcs_fused_elementwise[27] = true; // scale elementwise
++                op_srcs_fused_elementwise[21] = true; // add cur elementwise
++                op_srcs_fused_elementwise[22] = true; // scale elementwise
+             } else if (ggml_can_fuse_subgraph(cgraph, i, ssm_conv_decode_pattern, { i + 2, i + 6 }) &&
+                        ggml_check_edges(cgraph, i, ssm_conv_decode_edges) &&
+                        ggml_vk_can_fuse_ssm_conv_decode(ctx, cgraph, i, false)) {
+@@ -16861,9 +16872,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 }
+             }
+             if (need_disable) {
+-                if (getenv("GGML_VK_DEBUG_DISABLE") && fusion_string) {
+-                    fprintf(stderr, "VK_DISABLE_FUSION: %s at node %d (%s)\n", fusion_string, i, cgraph->nodes[i]->name);
+-                }
+                 ctx->num_additional_fused_ops = 0;
+                 ctx->fused_ops_write_mask = 1;
+                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/control_down_q8_0.comp b/ggml/src/ggml-vulkan/vulkan-shaders/control_down_q8_0.comp
+index 0977bc8..98bd47c 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/control_down_q8_0.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/control_down_q8_0.comp
+@@ -9,7 +9,7 @@
+ 
+ #include "types.glsl"
+ 
+-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout(binding = 0) readonly buffer W   { block_q8_0_packed16 data_w[]; };
+ layout(binding = 1) readonly buffer Cur { vec4 cur[]; };
+@@ -25,24 +25,7 @@ layout(push_constant) uniform PushConstants {
+     float eps;
+ };
+ 
+-shared float s_sg[4];
+-
+-float wg_sum(float v) {
+-    float sg = subgroupAdd(v);
+-    if (gl_NumSubgroups == 1u) {
+-        return sg;
+-    }
+-    if (subgroupElect()) {
+-        s_sg[gl_SubgroupID] = sg;
+-    }
+-    barrier();
+-    float tot = 0.0;
+-    for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+-        tot += s_sg[s];
+-    }
+-    barrier();
+-    return tot;
+-}
++shared float s_red[3][16];
+ 
+ void main() {
+     const uint row = gl_WorkGroupID.x;
+@@ -50,61 +33,78 @@ void main() {
+         return;
+     }
+ 
+-    const uint tid = gl_LocalInvocationID.x;
+-    const uint D4 = D >> 2;
++    const uint tid  = gl_LocalInvocationID.x;
++    const uint sg   = gl_SubgroupID;
++    const uint n_sg = gl_NumSubgroups;
++    const uint D4   = D >> 2;
+ 
+     float sq0 = 0.0;
+     float sq1 = 0.0;
+-    for (uint d = tid; d < D4; d += 64u) {
++    for (uint d = tid; d < D4; d += 256u) {
+         vec4 v0 = cur[off_cur4 + d];
+         vec4 v1 = msg[off_msg4 + d];
+         sq0 += dot(v0, v0);
+         sq1 += dot(v1, v1);
+     }
+ 
+-    const float inv0 = inversesqrt(wg_sum(sq0) / float(D) + eps);
+-    const float inv1 = inversesqrt(wg_sum(sq1) / float(D) + eps);
++    sq0 = subgroupAdd(sq0);
++    sq1 = subgroupAdd(sq1);
++    if (n_sg > 1u) {
++        if (subgroupElect()) {
++            s_red[0][sg] = sq0;
++            s_red[1][sg] = sq1;
++        }
++        barrier();
++        sq0 = 0.0;
++        sq1 = 0.0;
++        for (uint s = 0u; s < n_sg; ++s) {
++            sq0 += s_red[0][s];
++            sq1 += s_red[1][s];
++        }
++    }
++
++    const float inv0 = inversesqrt(sq0 / float(D) + eps);
++    const float inv1 = inversesqrt(sq1 / float(D) + eps);
+ 
+-    const uint half_blocks = D >> 5;
++    const uint half_blocks  = D >> 5;
+     const uint total_blocks = half_blocks * 2u;
+-    const uint row_base = row * total_blocks;
++    const uint total_v4     = D4 * 2u;
++    const uint row_base     = row * total_blocks;
+ 
+     float acc0 = 0.0;
+     float acc1 = 0.0;
+-    for (uint b = tid; b < total_blocks; b += 64u) {
++    for (uint idx = tid; idx < total_v4; idx += 256u) {
++        const uint b = idx >> 3;
++        const uint j = idx & 7u;
+         const float d_w = float(data_w[row_base + b].d);
+-        float dot32 = 0.0;
+-        if (b < half_blocks) {
+-            const uint x4_base = off_cur4 + b * 8u;
+-            [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+-                int q01 = int(data_w[row_base + b].qs[2u * j]);
+-                int q23 = int(data_w[row_base + b].qs[2u * j + 1u]);
+-                vec4 qv = vec4(
+-                    float(bitfieldExtract(q01, 0, 8)),
+-                    float(bitfieldExtract(q01, 8, 8)),
+-                    float(bitfieldExtract(q23, 0, 8)),
+-                    float(bitfieldExtract(q23, 8, 8)));
+-                dot32 += dot(qv, cur[x4_base + j]);
+-            }
+-            acc0 += d_w * dot32;
++        const int q01 = int(data_w[row_base + b].qs[2u * j]);
++        const int q23 = int(data_w[row_base + b].qs[2u * j + 1u]);
++        const vec4 qv = vec4(
++            float(bitfieldExtract(q01, 0, 8)),
++            float(bitfieldExtract(q01, 8, 8)),
++            float(bitfieldExtract(q23, 0, 8)),
++            float(bitfieldExtract(q23, 8, 8)));
++        if (idx < D4) {
++            acc0 += d_w * dot(qv, cur[off_cur4 + idx]);
+         } else {
+-            const uint x4_base = off_msg4 + (b - half_blocks) * 8u;
+-            [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+-                int q01 = int(data_w[row_base + b].qs[2u * j]);
+-                int q23 = int(data_w[row_base + b].qs[2u * j + 1u]);
+-                vec4 qv = vec4(
+-                    float(bitfieldExtract(q01, 0, 8)),
+-                    float(bitfieldExtract(q01, 8, 8)),
+-                    float(bitfieldExtract(q23, 0, 8)),
+-                    float(bitfieldExtract(q23, 8, 8)));
+-                dot32 += dot(qv, msg[x4_base + j]);
+-            }
+-            acc1 += d_w * dot32;
++            acc1 += d_w * dot(qv, msg[off_msg4 + idx - D4]);
+         }
+     }
+ 
+-    const float tot = wg_sum(acc0 * inv0 + acc1 * inv1);
+-    if (tid == 0u) {
++    float tot = subgroupAdd(acc0 * inv0 + acc1 * inv1);
++    if (n_sg > 1u) {
++        if (subgroupElect()) {
++            s_red[2][sg] = tot;
++        }
++        barrier();
++        if (tid == 0u) {
++            float sum = 0.0;
++            for (uint s = 0u; s < n_sg; ++s) {
++                sum += s_red[2][s];
++            }
++            dst[off_d + row] = sum;
++        }
++    } else if (tid == 0u) {
+         dst[off_d + row] = tot;
+     }
+ }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/depth_mix.comp b/ggml/src/ggml-vulkan/vulkan-shaders/depth_mix.comp
+index ca72bd1..ce4d1af 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/depth_mix.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/depth_mix.comp
+@@ -6,7 +6,7 @@
+ 
+ layout(constant_id = 0) const bool HAS_CUR = false;
+ 
+-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
++layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+ 
+ layout(binding = 0) readonly buffer States { vec4 states[]; };
+ layout(binding = 1) readonly buffer Cur    { vec4 cur[]; };
+@@ -26,24 +26,8 @@ layout(push_constant) uniform PushConstants {
+     float scale;
+ };
+ 
+-shared float s_sg[4];
+-
+-float wg_sum(float v) {
+-    float sg = subgroupAdd(v);
+-    if (gl_NumSubgroups == 1u) {
+-        return sg;
+-    }
+-    if (subgroupElect()) {
+-        s_sg[gl_SubgroupID] = sg;
+-    }
+-    barrier();
+-    float tot = 0.0;
+-    for (uint s = 0u; s < gl_NumSubgroups; ++s) {
+-        tot += s_sg[s];
+-    }
+-    barrier();
+-    return tot;
+-}
++// [0..6] = dot(states[k], q), [7] = dot(cur, q), [8] = dot(cur, cur)
++shared float s_red[9][32];
+ 
+ void main() {
+     const uint t = gl_WorkGroupID.x;
+@@ -58,20 +42,25 @@ void main() {
+     const uint q_base   = off_query4 + q * D4;
+     const uint dst_base = off_d4 + (t * Q + q) * D4;
+ 
+-    float rms_inv = 1.0;
+-    if (HAS_CUR) {
+-        float sq = 0.0;
+-        for (uint d = tid; d < D4; d += 64u) {
+-            vec4 cv = cur[cur_base + d];
+-            sq += dot(cv, cv);
+-        }
+-        rms_inv = inversesqrt(wg_sum(sq) / float(D4 * 4u) + eps);
+-    }
++    vec4 s0 = vec4(0.0), s1 = vec4(0.0), s2 = vec4(0.0), s3 = vec4(0.0);
++    vec4 s4 = vec4(0.0), s5 = vec4(0.0), s6 = vec4(0.0), c0 = vec4(0.0);
+ 
+     float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;
+-    float a4 = 0.0, a5 = 0.0, a6 = 0.0, acur = 0.0;
++    float a4 = 0.0, a5 = 0.0, a6 = 0.0, acur = 0.0, sq = 0.0;
++
++    if (tid < D4) {
++        vec4 qv = query[q_base + tid];
++        if (K_in > 0u) { s0 = states[st_base + 0u * D4 + tid]; a0 = dot(s0, qv); }
++        if (K_in > 1u) { s1 = states[st_base + 1u * D4 + tid]; a1 = dot(s1, qv); }
++        if (K_in > 2u) { s2 = states[st_base + 2u * D4 + tid]; a2 = dot(s2, qv); }
++        if (K_in > 3u) { s3 = states[st_base + 3u * D4 + tid]; a3 = dot(s3, qv); }
++        if (K_in > 4u) { s4 = states[st_base + 4u * D4 + tid]; a4 = dot(s4, qv); }
++        if (K_in > 5u) { s5 = states[st_base + 5u * D4 + tid]; a5 = dot(s5, qv); }
++        if (K_in > 6u) { s6 = states[st_base + 6u * D4 + tid]; a6 = dot(s6, qv); }
++        if (HAS_CUR)   { c0 = cur[cur_base + tid]; sq = dot(c0, c0); acur = dot(c0, qv); }
++    }
+ 
+-    for (uint d = tid; d < D4; d += 64u) {
++    for (uint d = tid + 512u; d < D4; d += 512u) {
+         vec4 qv = query[q_base + d];
+         if (K_in > 0u) a0 += dot(states[st_base + 0u * D4 + d], qv);
+         if (K_in > 1u) a1 += dot(states[st_base + 1u * D4 + d], qv);
+@@ -80,19 +69,71 @@ void main() {
+         if (K_in > 4u) a4 += dot(states[st_base + 4u * D4 + d], qv);
+         if (K_in > 5u) a5 += dot(states[st_base + 5u * D4 + d], qv);
+         if (K_in > 6u) a6 += dot(states[st_base + 6u * D4 + d], qv);
+-        if (HAS_CUR)   acur += dot(cur[cur_base + d], qv);
++        if (HAS_CUR) {
++            vec4 cv = cur[cur_base + d];
++            sq += dot(cv, cv);
++            acur += dot(cv, qv);
++        }
++    }
++
++    const uint sg_id = gl_SubgroupID;
++    const uint n_sg  = gl_NumSubgroups;
++    if (K_in > 0u) a0 = subgroupAdd(a0);
++    if (K_in > 1u) a1 = subgroupAdd(a1);
++    if (K_in > 2u) a2 = subgroupAdd(a2);
++    if (K_in > 3u) a3 = subgroupAdd(a3);
++    if (K_in > 4u) a4 = subgroupAdd(a4);
++    if (K_in > 5u) a5 = subgroupAdd(a5);
++    if (K_in > 6u) a6 = subgroupAdd(a6);
++    if (HAS_CUR) {
++        acur = subgroupAdd(acur);
++        sq   = subgroupAdd(sq);
++    }
++
++    if (n_sg > 1u) {
++        if (subgroupElect()) {
++            if (K_in > 0u) s_red[0][sg_id] = a0;
++            if (K_in > 1u) s_red[1][sg_id] = a1;
++            if (K_in > 2u) s_red[2][sg_id] = a2;
++            if (K_in > 3u) s_red[3][sg_id] = a3;
++            if (K_in > 4u) s_red[4][sg_id] = a4;
++            if (K_in > 5u) s_red[5][sg_id] = a5;
++            if (K_in > 6u) s_red[6][sg_id] = a6;
++            if (HAS_CUR) {
++                s_red[7][sg_id] = acur;
++                s_red[8][sg_id] = sq;
++            }
++        }
++        barrier();
++        a0 = 0.0; a1 = 0.0; a2 = 0.0; a3 = 0.0;
++        a4 = 0.0; a5 = 0.0; a6 = 0.0; acur = 0.0; sq = 0.0;
++        for (uint s = 0u; s < n_sg; ++s) {
++            if (K_in > 0u) a0 += s_red[0][s];
++            if (K_in > 1u) a1 += s_red[1][s];
++            if (K_in > 2u) a2 += s_red[2][s];
++            if (K_in > 3u) a3 += s_red[3][s];
++            if (K_in > 4u) a4 += s_red[4][s];
++            if (K_in > 5u) a5 += s_red[5][s];
++            if (K_in > 6u) a6 += s_red[6][s];
++            if (HAS_CUR) {
++                acur += s_red[7][s];
++                sq   += s_red[8][s];
++            }
++        }
+     }
+ 
++    const float rms_inv = HAS_CUR ? inversesqrt(sq / float(D4 * 4u) + eps) : 1.0;
++
+     const float NEG_INF = -3.402823466e+38;
+     float mx = NEG_INF;
+-    if (K_in > 0u) { a0 = wg_sum(a0) * scale; mx = max(mx, a0); }
+-    if (K_in > 1u) { a1 = wg_sum(a1) * scale; mx = max(mx, a1); }
+-    if (K_in > 2u) { a2 = wg_sum(a2) * scale; mx = max(mx, a2); }
+-    if (K_in > 3u) { a3 = wg_sum(a3) * scale; mx = max(mx, a3); }
+-    if (K_in > 4u) { a4 = wg_sum(a4) * scale; mx = max(mx, a4); }
+-    if (K_in > 5u) { a5 = wg_sum(a5) * scale; mx = max(mx, a5); }
+-    if (K_in > 6u) { a6 = wg_sum(a6) * scale; mx = max(mx, a6); }
+-    if (HAS_CUR)   { acur = wg_sum(acur) * rms_inv * scale; mx = max(mx, acur); }
++    if (K_in > 0u) { a0 *= scale; mx = max(mx, a0); }
++    if (K_in > 1u) { a1 *= scale; mx = max(mx, a1); }
++    if (K_in > 2u) { a2 *= scale; mx = max(mx, a2); }
++    if (K_in > 3u) { a3 *= scale; mx = max(mx, a3); }
++    if (K_in > 4u) { a4 *= scale; mx = max(mx, a4); }
++    if (K_in > 5u) { a5 *= scale; mx = max(mx, a5); }
++    if (K_in > 6u) { a6 *= scale; mx = max(mx, a6); }
++    if (HAS_CUR)   { acur = acur * rms_inv * scale; mx = max(mx, acur); }
+ 
+     float sm = 0.0;
+     float w0 = 0.0, w1 = 0.0, w2 = 0.0, w3 = 0.0;
+@@ -110,7 +151,20 @@ void main() {
+     w0 *= inv_sm; w1 *= inv_sm; w2 *= inv_sm; w3 *= inv_sm;
+     w4 *= inv_sm; w5 *= inv_sm; w6 *= inv_sm; wcur *= inv_sm * rms_inv;
+ 
+-    for (uint d = tid; d < D4; d += 64u) {
++    if (tid < D4) {
++        vec4 acc = vec4(0.0);
++        if (K_in > 0u) acc += w0 * s0;
++        if (K_in > 1u) acc += w1 * s1;
++        if (K_in > 2u) acc += w2 * s2;
++        if (K_in > 3u) acc += w3 * s3;
++        if (K_in > 4u) acc += w4 * s4;
++        if (K_in > 5u) acc += w5 * s5;
++        if (K_in > 6u) acc += w6 * s6;
++        if (HAS_CUR)   acc += wcur * c0;
++        dst[dst_base + tid] = acc;
++    }
++
++    for (uint d = tid + 512u; d < D4; d += 512u) {
+         vec4 acc = vec4(0.0);
+         if (K_in > 0u) acc += w0 * states[st_base + 0u * D4 + d];
+         if (K_in > 1u) acc += w1 * states[st_base + 1u * D4 + d];
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 9743fea..e1a0dfc 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -4218,6 +4218,8 @@ void llm_graph_context::build_conv_state_store(
+                 n_cols*channels, n_seqs,
+                 row_size, cell_offs);
+ 
++        // Expand cell before conv_x so [CONCAT, VIEW(last), CPY, ...] has no external-view_src VIEW inside the fusion window
++        ggml_build_forward_expand(gf, cell);
+         ggml_build_forward_expand(gf, ggml_cpy(ctx0, last, cell));
+         return;
+     }
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 95bd29e..bd6e651 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -218,8 +218,18 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+ 
+     ggml_build_forward_expand(gf, cur);
+     ggml_build_forward_expand(gf, history);
++    ggml_tensor * dyn_taps[4] = {};
+     if (dynamic) {
+         ggml_build_forward_expand(gf, dynamic);
++        const int64_t n_heads = dynamic->ne[0]/n_conv;
++        dynamic = ggml_reshape_3d(ctx0, dynamic, n_conv, n_heads, n_tokens);
++        ggml_build_forward_expand(gf, dynamic);
++        if (n_seq_tokens == 1 && n_seqs == 1 && n_conv == 4) {
++            for (int64_t lag = 0; lag < 4; ++lag) {
++                dyn_taps[lag] = ggml_view_2d(ctx0, dynamic, 1, n_heads, dynamic->nb[1], lag*dynamic->nb[0]);
++                ggml_build_forward_expand(gf, dyn_taps[lag]);
++            }
++        }
+     }
+ 
+     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
+@@ -233,16 +243,16 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+     out = ggml_reshape_2d(ctx0, out, n_channels, n_tokens);
+ 
+     if (dynamic) {
+-        const int64_t n_heads = dynamic->ne[0]/n_conv;
+-
+-        dynamic = ggml_reshape_3d(ctx0, dynamic, n_conv, n_heads, n_tokens);
++        const int64_t n_heads = dynamic->ne[1];
+ 
+         if (n_seq_tokens == 1 && n_seqs == 1) {
+             ggml_tensor * xt = ggml_reshape_3d(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, x)), n_channels/n_heads, n_heads, n_conv);
+             ggml_tensor * dyn_sum = nullptr;
+             for (int64_t lag = 0; lag < n_conv; ++lag) {
+                 ggml_tensor * window = ggml_view_2d(ctx0, xt, n_channels/n_heads, n_heads, xt->nb[1], (n_conv - 1 - lag)*xt->nb[2]);
+-                ggml_tensor * tap    = ggml_view_2d(ctx0, dynamic, 1, n_heads, dynamic->nb[1], lag*dynamic->nb[0]);
++                ggml_tensor * tap    = (n_conv == 4 && dyn_taps[lag])
++                    ? dyn_taps[lag]
++                    : ggml_view_2d(ctx0, dynamic, 1, n_heads, dynamic->nb[1], lag*dynamic->nb[0]);
+                 ggml_tensor * term   = ggml_mul(ctx0, window, tap);
+                 dyn_sum = dyn_sum ? ggml_add(ctx0, dyn_sum, term) : term;
+             }
+-- 
+2.56.1.windows.1
+

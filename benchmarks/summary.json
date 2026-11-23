@@ -1,0 +1,79 @@
+{
+  "hardware": {
+    "system": "ASUS ROG Flow Z13 (2025)",
+    "cpu": "AMD Ryzen AI Max+ 395",
+    "gpu": "AMD Radeon 8060S (gfx1151, RDNA 3.5, 40 CUs, wave64, KHR_coopmat)",
+    "memory_gib": 64,
+    "vulkan_heap_mib": 32843,
+    "os": "Windows 11 x64"
+  },
+  "model": {
+    "name": "Inkling-2-Mini-Uncensored-AD-Q4_K.gguf",
+    "sha256": "36e99f1f56ca33cb356f19d7e3822938f65af1cde978ad13170238928d4c955f",
+    "arch": "inkling2_loop",
+    "kv_cache": "f16",
+    "base_llama_cpp": "b12628 (8a97fa98a)"
+  },
+  "track_a_alternating_ab_2x32k_ub256": {
+    "short_107_tokens": {
+      "control_repeats_tps": [27.36, 26.28, 25.84, 26.99, 27.24, 27.01],
+      "control_median_tps": 27.00,
+      "optimized_repeats_tps": [35.84, 35.83, 35.74, 36.04, 35.52, 35.85],
+      "optimized_median_tps": 35.84,
+      "optimized_peak_cold_tps": 36.62,
+      "speedup_pct": 32.7,
+      "greedy_hash_exact_match": true,
+      "greedy_sha16": "9d2af481fd1eb5cc"
+    },
+    "long_27998_tokens": {
+      "control_decode_tps": 20.85,
+      "control_prefill_tps": 242.61,
+      "control_prefill_s": 115.40,
+      "optimized_decode_paired_tps": 26.26,
+      "optimized_decode_fresh_tps": 27.44,
+      "optimized_prefill_paired_tps": 271.49,
+      "optimized_prefill_fresh_tps": 281.03,
+      "decode_speedup_pct_range": [25.9, 31.6],
+      "prefill_speedup_pct_range": [11.9, 15.8]
+    },
+    "vulkan_profile_short_decode": {
+      "control_dispatches_per_token": 7145,
+      "optimized_dispatches_per_token": 1881,
+      "dispatch_reduction_pct": -73.7,
+      "control_gpu_ms_per_token": 39.89,
+      "optimized_gpu_ms_per_token": 26.46,
+      "gpu_time_reduction_pct": -33.7,
+      "fused_counts_per_token": {
+        "SSM_CONV_DECODE": 176,
+        "SSM_CONV_DECODE_DYN": 16,
+        "DEPTH_MIX_CUR": 96,
+        "DEPTH_MIX_BANK": 24,
+        "CONTROL_DOWN_Q8_0": 96,
+        "CONTROL_UP_APPLY_Q8_0": 96,
+        "REL_BIAS_MASK_DIRECT": 48,
+        "L2_CLIP": 48,
+        "L2_CLIP_SCALE": 96,
+        "SITU": 48,
+        "SIGMOID_MUL": 48,
+        "TOPK_MOE_SIGMOID_NORM_BIAS": 48
+      }
+    }
+  },
+  "quality_verification": {
+    "short_coding_merge_intervals": { "tests_passed": 7, "tests_total": 7, "decode_tps": 35.62 },
+    "short_code_review": { "verdict": "PASS", "decode_tps": 35.29 },
+    "long_28k_coding_merge_intervals": { "tests_passed": 7, "tests_total": 7, "decode_tps": 27.19 },
+    "long_28k_code_review": { "verdict": "PASS", "decode_tps": 27.15 }
+  },
+  "track_b_context_and_batching": {
+    "2x32k_ub256": { "vram_mib": 19516, "compute_vram_mib": 1782, "host_compute_mib": 84, "prefill_28k_tps": 281.03, "decode_28k_tps": 27.44 },
+    "2x32k_ub512": { "vram_mib": 21288, "compute_vram_mib": 3474, "host_compute_mib": 169, "prefill_28k_tps": 280.98, "decode_28k_tps": 27.18 },
+    "2x32k_ub1024": { "vram_mib": 20169, "compute_vram_mib": 2195, "host_compute_mib": 6581, "prefill_28k_tps": 181.68, "note": "Overflows 4 GiB Vulkan buffer limit onto host memory" },
+    "2x64k_ub256": { "vram_mib": 23107, "free_headroom_mib": 8093, "kv_global_mib": 4096, "kv_swa_mib": 400, "compute_vram_mib": 3325, "prefill_28k_tps": 251.81, "decode_28k_tps": 27.09 }
+  },
+  "track_b_compaction_21k_session": {
+    "baseline_current": { "wall_s": 96.35, "prompt_tokens": 20742, "cached_tokens": 0, "prefill_s": 79.03, "gen_tokens": 372, "decode_tps": 21.52, "facts": "4/4", "schema_issues": 0 },
+    "standalone_optimized": { "wall_s": 84.79, "prompt_tokens": 20740, "cached_tokens": 0, "prefill_s": 71.74, "gen_tokens": 357, "decode_tps": 27.58, "facts": "4/4", "schema_issues": 0 },
+    "kv_preserving_optimized": { "wall_s": 15.88, "prompt_tokens": 21121, "cached_tokens": 20985, "cache_hit_pct": 99.36, "prefill_s": 0.91, "gen_tokens": 415, "decode_tps": 27.88, "facts": "4/4", "schema_issues": 0, "speedup_x": 6.07 }
+  }
+}
